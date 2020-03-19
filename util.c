@@ -526,6 +526,599 @@ ruby_qsort(void* base, const size_t nel, const size_t size, cmpfunc_t *cmp, void
 }
 #endif /* HAVE_GNU_QSORT_R */
 
+#ifdef HAVE_GNU_QSORT_R
+
+// mm引用
+#define mmtype long
+#define mmcount (16 / SIZEOF_LONG)
+#define A ((mmtype*)a)
+#define B ((mmtype*)b)
+#define C ((mmtype*)c)
+#define D ((mmtype*)d)
+
+#define mmstep (sizeof(mmtype) * mmcount)
+#define mmprepare(base, size) do {\
+ if (((VALUE)(base) % sizeof(mmtype)) == 0 && ((size) % sizeof(mmtype)) == 0) \
+   if ((size) >= mmstep) mmkind = 1;\
+   else              mmkind = 0;\
+ else                mmkind = -1;\
+ high = ((size) / mmstep) * mmstep;\
+ low  = ((size) % mmstep);\
+} while (0)\
+
+#define mmarg mmkind, size, high, low
+#define mmargdecl int mmkind, size_t size, size_t high, size_t low
+
+static void mmswap_(register char *a, register char *b, mmargdecl)
+{
+ if (a == b) return;
+ if (mmkind >= 0) {
+   register mmtype s;
+#if mmcount > 1
+   if (mmkind > 0) {
+     register char *t = a + high;
+     do {
+       s = A[0]; A[0] = B[0]; B[0] = s;
+       s = A[1]; A[1] = B[1]; B[1] = s;
+#if mmcount > 2
+       s = A[2]; A[2] = B[2]; B[2] = s;
+#if mmcount > 3
+       s = A[3]; A[3] = B[3]; B[3] = s;
+#endif
+#endif
+       a += mmstep; b += mmstep;
+     } while (a < t);
+   }
+#endif
+   if (low != 0) { s = A[0]; A[0] = B[0]; B[0] = s;
+#if mmcount > 2
+     if (low >= 2 * sizeof(mmtype)) { s = A[1]; A[1] = B[1]; B[1] = s;
+#if mmcount > 3
+       if (low >= 3 * sizeof(mmtype)) {s = A[2]; A[2] = B[2]; B[2] = s;}
+#endif
+     }
+#endif
+   }
+ }
+ else {
+   register char *t = a + size, s;
+   do {s = *a; *a++ = *b; *b++ = s;} while (a < t);
+ }
+}
+#define mmswap(a,b) mmswap_((a),(b),mmarg)
+
+#endif
+
+// ここまで
+
+
+#define TIMSORT_MINGALLOP 7
+#define TIMSORT_STACKSIZE 128
+#define MAX(a,b) ((a)>(b) ? (a) : (b))
+#define MIN(a,b) ((a)<(b) ? (a) : (b))
+typedef struct { char *pos;size_t len; } timsort_stack_node;
+typedef struct { char *tmp_store; size_t allocated_size;} tim_temp_array;
+
+
+// 最小ランの計算
+int
+rb_calc_minrun(const size_t nel) {
+  const int shift = MAX(64 - nlz_long_long(nel), 6) - 6;
+  const int minrun = (int)(nel >> shift);
+  if (nel & ((1ull << shift) - 1)) {
+    return minrun + 1;
+  }
+  return minrun;
+}
+
+size_t
+rb_timsort_galloping(char* base, size_t len, char* key,size_t anchor, int isRight, cmpfunc_t *cmp, void *d, mmargdecl) {
+  int last_o = 0, o, max_o, o_sign;
+  size_t l, c, r;
+  int cp = (*cmp)(key,base+anchor*size,d);
+
+  if (cp < 0 || (!isRight && cp == 0)) {
+    if (anchor == 0) {
+      return 0;
+    }
+    o = -1; o_sign = -1; max_o = -(int)anchor;
+  } else {
+    if (anchor == len - 1) {
+      return len;
+    }
+    o = 1; o_sign = 1; max_o = (int)(len - anchor - 1);
+  }
+
+  for (;;) {
+    if (max_o / o <= 1) {
+      o = max_o;
+      if (o < 0) {
+        cp = (*cmp)(key, base, d);
+        if ((isRight && cp < 0) || (!isRight && cp <= 0)) {
+          return 0;
+        }
+      } else {
+        cp = (*cmp)(base + (len - 1) * size, key, d);
+        if ((isRight && cp <= 0) || (!isRight && cp < 0)) {
+          return len;
+        }
+      }
+      break;
+    }
+    c = anchor+o;
+    cp = (*cmp)(key, base + c * size, d);
+    if (o > 0) {
+      if ((isRight && cp < 0) || (!isRight && cp <= 0)) {
+        break;
+      }
+    } else {
+      if ((isRight && cp >= 0) || (!isRight && cp > 0)) {
+        break;
+      }
+    }
+    last_o = o;
+    o = (o << 1) + o_sign;
+  }
+
+  if (o < 0) {
+    l = anchor + o;
+    r = anchor + last_o;
+  } else {
+    l = anchor + last_o;
+    r = anchor + o;
+  }
+  while (r - l > 1) {
+    c = l + ((r - l) >> 1);
+    cp = (*cmp)(key, base + c * size, d);
+    if ((isRight && cp < 0) || (!isRight && cp <= 0) ){
+      r = c;
+    } else {
+      l = c;
+    }
+
+  }
+  return r;
+}
+
+
+#define COPY_PLUS(L,R,pl,pr,size) do{memcpy(L+pl*size,R+pr*size,size);pl++;pr++;}while(0)
+#define COPY_MINUS(L,R,pl,pr,size) do{memcpy(L+pl*size,R+pr*size,size);pl--;pr--;}while(0)
+
+void
+rb_timsort_left_merge(cmpfunc_t *cmp, void *d, char *L, char *R, int L_len, int R_len,char *storage, int *mingallop, mmargdecl) {
+  int ming = *mingallop;
+  int L_num, R_num, pl = 0, pr = 0, pb = 0;
+  char* base = L;
+  size_t k;
+  memcpy(storage, base, L_len * size);
+  L = storage;
+  COPY_PLUS(base, R, pb, pr, size);
+
+  if (R_len == 1) {
+    //終了処理
+    memcpy(base + pb * size, L + pl * size, size * (L_len - pl));
+    *mingallop = ming;
+    return;
+  }
+
+  for (;;) {
+    L_num = R_num = 0;
+    for (;;) {
+      if ((*cmp)(L + pl * size, R + pr * size, d) <= 0) {
+        COPY_PLUS(base, L, pb, pl, size);
+        L_num++;  R_num = 0;
+        if (ming <= L_num) break;
+      } else {
+        COPY_PLUS(base, R, pb, pr, size);
+        R_num++;  L_num = 0;
+        if (pr == R_len) {
+          //終了処理
+          memcpy(base + pb * size, L + pl * size, size * (L_len - pl));
+          *mingallop = ming;
+          return;
+        }
+        if (ming <= R_num) break;
+      }
+    }
+    ming++;
+    for (;;) {
+      if (ming != 0) ming--;
+      k = rb_timsort_galloping(L + pl * size, L_len - pl, R + pr * size, 0, 1, cmp, d, mmarg);
+      memcpy(base + pb * size, L + pl * size, k * size); pb += k; pl += k;
+      COPY_PLUS(base, R, pb, pr, size);
+      if (pr == R_len) {
+        //終了処理
+        memcpy(base + pb * size, L + pl * size, size * (L_len - pl));
+        *mingallop = ming;
+        return;
+      }
+      if (L_num && k < TIMSORT_MINGALLOP) {
+        ming++;
+        break;
+      }
+      k = rb_timsort_galloping(R + pr * size, R_len - pr, L + pl * size, 0, 0, cmp, d, mmarg);
+      memmove(base + pb * size, R + pr * size, k * size); pb += k; pr += k;
+      if (pr == R_len) {
+        //終了処理
+        memcpy(base + pb * size, L + pl * size, size * (L_len - pl));
+        *mingallop = ming;
+        return;
+      }
+      COPY_PLUS(base, L, pb, pl, size);
+      if (R_num && k < TIMSORT_MINGALLOP) {
+        ming++;
+        break;
+      }
+    }
+  }
+
+}
+
+void
+rb_timsort_right_merge(cmpfunc_t *cmp, void *d, char *L, char *R, int L_len, int R_len,char *storage, int *mingallop, mmargdecl) {
+  int ming = *mingallop;
+  int L_num, R_num, pl = L_len - 1, pr = R_len - 1, pb = L_len + R_len - 1;
+  char* base = L;
+  size_t k;
+
+  memcpy(storage, R, R_len * size);
+  R = storage;
+  COPY_MINUS(base, L, pb, pl, size);
+
+
+  if (L_len == 1) {
+    //終了処理
+    memcpy(base, R, size * (pr + 1));
+    *mingallop = ming;
+    return;
+  }
+
+  for (;;) {
+    L_num = R_num = 0;
+    for (;;) {
+      if ((*cmp)(L + pl * size, R + pr * size, d) <= 0) {
+        COPY_MINUS(base, R, pb, pr, size);
+        R_num++; L_num = 0;
+        if (ming <= R_num) break;
+      } else {
+        COPY_MINUS(base, L, pb, pl, size);
+        L_num++; R_num = 0;
+        if (pl == -1) {
+
+          //終了処理
+          memcpy(base, R, size * (pr + 1));
+          *mingallop = ming;
+          return;
+        }
+        if (ming <= L_num) break;
+      }
+    }
+    ming++;
+    for (;;) {
+      if (ming != 0) ming--;
+      k = rb_timsort_galloping(L, pl + 1, R + pr * size, pl, 1, cmp, d, mmarg);
+      memmove(base + (pr + k + 1) * size, L + k * size, (pl + 1 - k) * size);
+      pb = pr + (int)k; pl = (int)(k - 1);
+
+      if (pl == -1) {
+        //終了処理
+        memcpy(base, R, size * (pr + 1));
+        *mingallop = ming;
+        return;
+      }
+      COPY_MINUS(base, R, pb, pr, size);
+      if (L_num && pl + 1 - k < TIMSORT_MINGALLOP) {
+        ming++;
+        break;
+      }
+      k = rb_timsort_galloping(R, pr + 1, L + pl * size, pr, 0, cmp, d, mmarg);
+      memcpy(base + (pl + k + 1) * size, R + k * size, (pr + 1 - k) * size); pb = pl + (int)k; pr = (int)(k - 1);
+      COPY_MINUS(base, L, pb, pl, size);
+      if (pl == -1) {
+        //終了処理
+        memcpy(base, R, size * (pr + 1));
+        *mingallop = ming;
+        return;
+      }
+      
+      if (R_num && pr + 1 - k < TIMSORT_MINGALLOP) {
+        ming++;
+        break;
+      }
+    }
+  }
+
+}
+
+void
+rb_timsort_merge(void* base, const size_t nel, cmpfunc_t *cmp, void *d, timsort_stack_node *stack,
+    timsort_stack_node *cur_stack, int *mingallop, tim_temp_array *arr, mmargdecl) {
+  size_t L_len = (cur_stack - 2) -> len;
+  size_t R_len = (cur_stack - 1) -> len;
+  char *L = (cur_stack - 2) -> pos;
+  char *R = (cur_stack - 1) -> pos;
+  size_t arr_size;
+
+  size_t k = rb_timsort_galloping(L, L_len, R, 0, 1, cmp, d, mmarg);
+  L += size * k;
+  L_len -= k;
+  if (L_len == 0) { // ギャロッピングで全データがRの先頭より小さいとき
+    *mingallop /= 2;
+    return;
+  }
+  k = rb_timsort_galloping(R, R_len, R-size, R_len-1, 0, cmp, d, mmarg);
+  R_len = k;
+
+  //  メモリ確保
+  arr_size = MIN(L_len, R_len);
+  if (arr -> tmp_store == NULL || arr -> allocated_size < arr_size) {
+    arr -> tmp_store = xrealloc(arr -> tmp_store, arr_size * size);
+    arr -> allocated_size = arr_size;
+  }
+
+  if (L_len < R_len) {
+    rb_timsort_left_merge(cmp, d, L, R, L_len, R_len, arr -> tmp_store, mingallop, mmarg);
+  } else {
+    rb_timsort_right_merge(cmp, d, L, R, L_len, R_len, arr -> tmp_store, mingallop, mmarg);
+  }
+
+  return;
+
+}
+
+
+
+// cmp(x,y,d)の形で使うと比較できる
+void
+rb_timsort(void* base, const size_t nel, const size_t size, cmpfunc_t *cmp, void *d) {
+  char *cur = base;  // いまソートしている場所
+  const char *end = (char*)base + size * (nel - 1); // 右端
+  int mingallop = TIMSORT_MINGALLOP;
+  int min_run, run, trun;  // minrun -> データ数依存 run -> 最長列 trun -> 最低限run
+  enum {size_bits = sizeof(size) * CHAR_BIT};
+  timsort_stack_node stack[size_bits];          /* enough for size_t size */
+  timsort_stack_node *top = stack;
+  tim_temp_array _arr, *arr; 
+  char *tmp = xmalloc(size);
+
+  // mm用変数
+  int mmkind;
+  size_t high, low, n;
+
+  // 不変条件をチェックし始める回数
+  int check_inv_amount = 3;
+
+
+
+
+  if (nel <= 1) return;
+  mmprepare(base, size);
+  if (nel < 64) {
+    // 二分挿入ソート
+    size_t i;
+    size_t l, c, r;
+    for (i = 1; i < nel; i++) {
+      size_t j;
+      size_t loc;
+      if ((*cmp)(cur + (i - 1) * size, cur + i * size, d) <= 0) continue;
+      memcpy(tmp, cur + i * size, size);
+      l = 0; r = i - 1; c = r >> 1;
+      if ((*cmp)(tmp, cur, d) < 0) {
+        loc = 0;
+      } else if ((*cmp)(tmp, cur + r * size, d) > 0) {
+        loc = r;
+      } else {
+        while (1) {
+          int v = (*cmp)(tmp, cur + c * size, d);
+          if (v < 0) {
+            if (c - l <= 1) {
+              loc = c; break;
+            }
+            r = c;
+          } else {
+            if (r - c <= 1) {
+              loc = c + 1;
+              break;
+            }
+            l = c;
+          }
+          c = l + ((r - l) >> 1);
+        }
+      }
+      
+      memmove(cur + (loc + 1) * size, cur + loc * size, (i - loc) * size);
+      memcpy(cur + loc * size, tmp, size);
+    }
+    return;
+  }
+  min_run = rb_calc_minrun(nel);
+
+  arr = &_arr;
+  arr -> allocated_size = 0;
+  arr -> tmp_store = NULL;
+
+
+
+
+  // スタックにノードをプッシュする部分
+  for (;;) {
+
+    // ランの計算
+
+    if (end - cur == 0) {  // 現在地点が終点
+      run = 1;
+    } else if (end - cur == size) {  // 現在地点が終点1つ前
+      if ((*cmp)(end - size, end, d) > 0) {  // 二要素の入れ替え
+        mmswap(end - size, end);
+      }
+      run = 2;
+    } else {
+      char *pos = cur + 2 * size;
+      if ((*cmp)(cur, cur + size, d) <= 0) { // 最初の2要素が昇順
+        for (;;) {
+          if (end - pos == 0) {
+            break;
+          }
+          if ((*cmp)(pos - size, pos, d) > 0) {
+            break;
+          }
+          pos += size;
+        }
+        run = (pos - cur) / size;
+      } else {  // 降順
+        for (;;) {
+          if (end - pos == 0) {
+            break;
+          }
+          if ((*cmp)(pos - size, pos, d) <= 0) {
+            break;
+          }
+          pos += size;
+        }
+        run = (pos - cur) / size;
+        { // 反転
+          char *l = cur;
+          pos -= size;
+          while (l < pos) {
+            mmswap(l, pos); l += size; pos -= size;
+          }
+        }
+      }
+    }
+
+
+    trun = min_run;
+    if (trun >= (end - cur) / size) { // 配列の端を超えたとき
+      trun = (end - cur) / size + 1;
+    }
+    if (trun > run) { // ランが最小ランより短いとき
+      // 二分挿入ソート
+      size_t i;
+      size_t l, c, r;
+      for (i = run; i < trun; i++) {
+        size_t j;
+        size_t loc;
+        if ((*cmp)(cur + (i - 1) * size, cur + i * size, d) <= 0) continue;
+        memcpy(tmp, cur + i * size, size);
+        l = 0; r = i - 1; c = r >> 1;
+        if ((*cmp)(tmp, cur, d) < 0) {
+          loc = 0;
+        } else if ((*cmp)(tmp, cur + r * size, d) > 0) {
+          loc = r;
+        } else {
+          
+          while (1) {
+            int v = (*cmp)(tmp, cur + c * size, d);
+            if (v < 0) {
+              if (c - l <= 1) {
+                loc = c; break;
+              }
+              r = c;
+            } else {
+              if (r - c <= 1) {
+                loc = c + 1;
+                break;
+              }
+              l = c;
+            }
+            c = l + ((r - l) >> 1);
+            
+          }
+        }
+        memmove(cur + (loc + 1) * size, cur + loc * size, (i - loc) * size);
+        memcpy(cur + loc * size, tmp, size);
+
+      }
+      run = trun;
+    }
+
+    //スタックへのプッシュ
+    //一番上を参照するときは(top-1)->len と使う
+    top -> pos = cur;
+    top -> len = run;
+    top++;
+
+    cur += run * size;
+    if (cur > end) {
+      break; // 終了処理
+    }
+
+    // check_inv_amountの回数ぶん繰り返す
+    if (check_inv_amount) {
+      check_inv_amount--;
+      continue;      
+    }
+
+
+    // 不変条件チェック部分
+
+    for (;;) {
+      //  breakするとpushの先頭に行く
+
+      if (stack >= top - 1) { // スタック0 or 1
+        break;
+      }
+      if (stack == top - 2) { // スタック2
+        if ((top - 2) -> len > (top - 1) -> len) {  // 一番下の長さ > 一個上の長さ
+          break;
+        }
+      } else {  // 要素数3以上
+        if ((top - 3) -> len > (top - 2) -> len + (top - 1) -> len && (top - 2) -> len > (top - 1) -> len) {
+          // top-3 > top-2 + top->1  &&  top-2 > top->1 を満たす場合はマージしない
+          break;
+        }
+      }
+
+      // ここを通る場合は不変条件を満たしていない
+      // breakするとforを一つ抜け、不変条件チェックに進む
+      for (;;) {
+
+        if (stack >= top - 1) {  // スタック 0 or 1
+          break;
+        }
+        if (stack == top - 2) { // スタック 2
+          if ((top - 1) -> len + (top - 2) -> len == nel || (top - 1) -> len >= (top - 2) -> len) {
+            //データ数とスタックの合計値が同じ or 不変条件
+            rb_timsort_merge(base, nel, cmp, d, stack, top, &mingallop, arr, mmarg);
+            (top - 2) -> len += (top - 1) -> len; top--; // POP
+          }
+          break;
+        }
+
+        if ((top - 2) -> len <= (top - 1) -> len) { //不変条件
+          rb_timsort_merge(base, nel, cmp, d, stack, top, &mingallop, arr, mmarg);
+          (top - 2) -> len += (top - 1) -> len; top--; // POP
+
+        } else if (((top - 3) -> len <= (top - 2) -> len + (top - 1) -> len) ||
+           ((stack <= top - 4) ? ((top - 4) -> len <= (top - 3) -> len + (top - 2) -> len) : (0))) {
+          // 3要素の不変条件
+          // スタックの要素が4以上のときは、深さ4つまで不変条件を確かめる
+
+          rb_timsort_merge(base, nel, cmp, d, stack, top - 1, &mingallop, arr, mmarg);
+          (top - 3) -> len += (top - 2) -> len;
+          *(top - 2) = *(top - 1);  // 一番上をひとつ下ろしてくる
+          top--;
+          
+        }
+        break;
+
+      }
+
+
+
+
+    }
+
+  }
+  while (stack != top - 1) {
+    rb_timsort_merge(base, nel, cmp, d, stack, top, &mingallop, arr, mmarg);
+    
+    (top - 2) -> len += (top - 1) -> len; top--; // POP
+  }
+
+  return;
+}
+
 char *
 ruby_strdup(const char *str)
 {

@@ -62,6 +62,9 @@ void ruby_qsort(void *, const size_t, const size_t,
 		int (*)(const void *, const void *, void *), void *);
 #endif
 
+void rb_timsort(void *, const size_t, const size_t,
+		int (*)(const void *, const void *, void *), void *);
+
 void ruby_setenv(const char *, const char *);
 void ruby_unsetenv(const char *);
 

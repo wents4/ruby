@@ -2900,6 +2900,75 @@ rb_ary_sort(VALUE ary)
     return ary;
 }
 
+VALUE
+rb_ary_timsort_bang(VALUE ary)
+{
+    rb_ary_modify(ary);
+    assert(!ARY_SHARED_P(ary));
+    if (RARRAY_LEN(ary) > 1) {
+	VALUE tmp = ary_make_substitution(ary); /* only ary refers tmp */
+	struct ary_sort_data data;
+	long len = RARRAY_LEN(ary);
+	RBASIC_CLEAR_CLASS(tmp);
+	data.ary = tmp;
+	data.cmp_opt.opt_methods = 0;
+	data.cmp_opt.opt_inited = 0;
+	RARRAY_PTR_USE(tmp, ptr, {
+                    rb_timsort(ptr, len, sizeof(VALUE),
+                       rb_block_given_p()?sort_1:sort_2, &data);
+	}); /* WB: no new reference */
+	rb_ary_modify(ary);
+        if (ARY_EMBED_P(tmp)) {
+            if (ARY_SHARED_P(ary)) { /* ary might be destructively operated in the given block */
+                rb_ary_unshare(ary);
+		FL_SET_EMBED(ary);
+            }
+	    ary_memcpy(ary, 0, ARY_EMBED_LEN(tmp), ARY_EMBED_PTR(tmp));
+            ARY_SET_LEN(ary, ARY_EMBED_LEN(tmp));
+        }
+        else {
+            if (!ARY_EMBED_P(ary) && ARY_HEAP_PTR(ary) == ARY_HEAP_PTR(tmp)) {
+                FL_UNSET_SHARED(ary);
+                ARY_SET_CAPA(ary, RARRAY_LEN(tmp));
+            }
+            else {
+                assert(!ARY_SHARED_P(tmp));
+                if (ARY_EMBED_P(ary)) {
+                    FL_UNSET_EMBED(ary);
+                }
+                else if (ARY_SHARED_P(ary)) {
+                    /* ary might be destructively operated in the given block */
+                    rb_ary_unshare(ary);
+                }
+                else {
+                    ary_heap_free(ary);
+                }
+                ARY_SET_PTR(ary, ARY_HEAP_PTR(tmp));
+                ARY_SET_HEAP_LEN(ary, len);
+                ARY_SET_CAPA(ary, ARY_HEAP_LEN(tmp));
+            }
+            /* tmp was lost ownership for the ptr */
+            FL_UNSET(tmp, FL_FREEZE);
+            FL_SET_EMBED(tmp);
+            ARY_SET_EMBED_LEN(tmp, 0);
+            FL_SET(tmp, FL_FREEZE);
+        }
+        /* tmp will be GC'ed. */
+        RBASIC_SET_CLASS_RAW(tmp, rb_cArray); /* rb_cArray must be marked */
+    }
+    ary_verify(ary);
+    return ary;
+}
+
+// TODO テスト用VALUE rb_ary_timsortの追加
+VALUE
+rb_ary_timsort(VALUE ary)
+{
+    ary = rb_ary_dup(ary);
+    rb_ary_timsort_bang(ary);
+    return ary;
+}
+
 static VALUE rb_ary_bsearch_index(VALUE ary);
 
 /*
@@ -6916,6 +6985,10 @@ Init_Array(void)
     rb_define_method(rb_cArray, "sort", rb_ary_sort, 0);
     rb_define_method(rb_cArray, "sort!", rb_ary_sort_bang, 0);
     rb_define_method(rb_cArray, "sort_by!", rb_ary_sort_by_bang, 0);
+
+    rb_define_method(rb_cArray, "timsort", rb_ary_timsort, 0);
+    rb_define_method(rb_cArray, "timsort!", rb_ary_timsort_bang, 0);
+
     rb_define_method(rb_cArray, "collect", rb_ary_collect, 0);
     rb_define_method(rb_cArray, "collect!", rb_ary_collect_bang, 0);
     rb_define_method(rb_cArray, "map", rb_ary_collect, 0);
